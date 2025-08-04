@@ -406,6 +406,8 @@ class BioformatsReader(PlateReader):
 
     def read(self, series, c):
         self.metadata._reader.setSeries(self.metadata.active_series[series])
+        if c < 0:
+            c += self.metadata.num_channels
         index = self.metadata._reader.getIndex(0, c, 0)
         byte_array = self.metadata._reader.openBytes(index)
         endian = "<" if self.metadata._reader.isLittleEndian() else ">"
@@ -1286,7 +1288,7 @@ class PyramidWriter:
                 subifds=int(self.num_levels - 1),
                 dtype=dtype,
                 tile=self.tile_shapes[0],
-                resolution=(resolution_cm, resolution_cm, "centimeter"),
+                # resolution=(resolution_cm, resolution_cm, "centimeter"),
                 # FIXME Propagate this from input files (especially RGB).
                 photometric="minisblack",
                 compression="adobe_deflate",
