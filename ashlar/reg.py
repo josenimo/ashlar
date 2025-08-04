@@ -406,8 +406,10 @@ class BioformatsReader(PlateReader):
 
     def read(self, series, c):
         self.metadata._reader.setSeries(self.metadata.active_series[series])
+        # modification seen in https://github.com/labsyspharm/ashlar/commit/c1fe1dd9ea60cd4bd9cc858535ac177c0596b02f
         if c < 0:
             c += self.metadata.num_channels
+        # end of mod
         index = self.metadata._reader.getIndex(0, c, 0)
         byte_array = self.metadata._reader.openBytes(index)
         endian = "<" if self.metadata._reader.isLittleEndian() else ">"
