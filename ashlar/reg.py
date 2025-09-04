@@ -560,7 +560,7 @@ class EdgeAligner(object):
             for i in range(self.metadata.num_images)
         ])
         threshold = skimage.filters.threshold_otsu(energies)
-        self.foreground = energies > threshold
+        self.foreground = energies >= threshold
 
     def compute_threshold(self):
         if self.max_error is not None:
