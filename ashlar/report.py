@@ -29,7 +29,7 @@ cmap_yellow = mcolors.LinearSegmentedColormap(
 
 def generate_report(path, aligners):
     aligner0, *aligners = aligners
-    pdf = PDF(unit="in", format="letter")
+    pdf = PDF(unit="pt", format="letter")
     pdf.set_font("Helvetica")
 
     pdf.add_page()
