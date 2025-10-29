@@ -169,32 +169,55 @@ def plot_edge_map(
     return fig
 
 
-def plot_edge_shifts(aligner, img=None, bounds=True, im_kwargs=None):
-    if im_kwargs is None:
-        im_kwargs = {}
-    fig = plt.figure()
-    ax = plt.gca()
-    draw_mosaic_image(ax, aligner, img, **im_kwargs)
-    h, w = aligner.reader.metadata.size
-    if bounds:
-        # Bounding boxes denoting new tile positions.
-        for xy in np.fliplr(aligner.positions):
-            rect = mpatches.Rectangle(xy, w, h, color='black', fill=False,
-                                      lw=0.5)
-            ax.add_patch(rect)
+def plot_edge_shifts(
+        aligner,
+        img=None,
+        pos="metadata",
+        bounds=True,
+        all_edges=False,
+        cmap=None,
+        im_kwargs=None,
+):
+    if pos == "metadata":
+        centers = aligner.metadata.centers - aligner.metadata.origin
+    elif pos == "aligner":
+        centers = aligner.centers
+    else:
+        raise ValueError("pos must be either 'metadata' or 'aligner'")
+    cmap = cmap or cmap_yellow
+    im_kwargs = im_kwargs or {}
+    fig, ax = plt.subplots()
+    draw_mosaic_image(ax, aligner, img, cmap=cmap, **im_kwargs)
+    pos = np.fliplr(centers)
     # Compute per-edge relative shifts from tile positions.
-    edges = np.array(list(aligner.spanning_tree.edges))
-    dist = aligner.metadata.positions - aligner.positions
+    graph = aligner.neighbors_graph if all_edges else aligner.spanning_tree
+    edges = np.array(list(graph.edges))
+    pixel_size = aligner.reader.metadata.pixel_size
+    dist = (aligner.metadata.positions - aligner.positions) * pixel_size
     shifts = dist[edges[:, 0]] - dist[edges[:, 1]]
     shift_distances = np.linalg.norm(shifts, axis=1)
+    dmin = shift_distances.min()
+    dmax = shift_distances.max()
+    edge_cmap = mcm.Blues_r
     # Spanning tree with nodes at new tile positions, edges colored by shift
     # distance (brighter = farther).
     nx.draw(
-        aligner.spanning_tree, ax=ax, with_labels=True,
-        pos=np.fliplr(aligner.centers), edge_color=shift_distances,
-        edge_cmap=plt.get_cmap('Blues_r'), width=2, node_size=100, font_size=6
+        graph, ax=ax, with_labels=True, pos=pos, edge_color=shift_distances,
+        edge_cmap=edge_cmap, width=2, node_size=100, font_size=6
     )
-    fig.set_facecolor('black')
+    if bounds:
+        draw_borders(ax, aligner, pos)
+    cbar = fig.colorbar(
+        mcm.ScalarMappable(mcolors.Normalize(dmin, dmax), edge_cmap),
+        label="Shift distance (\u00B5m)",
+        location="right",
+        shrink=0.5,
+        ax=ax,
+    )
+    ax.set_frame_on(False)
+    ax.margins(0)
+    fig.tight_layout()
+    return fig
 
 
 def plot_edge_quality(aligner, annotate=True):
