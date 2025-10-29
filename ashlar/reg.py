@@ -481,7 +481,7 @@ def neighbors_graph(aligner):
                                              metric='cityblock')
         sp = scipy.spatial.distance.squareform(pdist)
         max_distance = aligner.metadata.size.max() + 1
-        edges = zip(*np.nonzero((sp > 0) & (sp < max_distance)))
+        edges = np.transpose(np.nonzero((sp > 0) & (sp < max_distance))).tolist()
         graph = nx.from_edgelist(edges)
         graph.add_nodes_from(range(aligner.metadata.num_images))
         aligner._neighbors_graph = graph
