@@ -5,12 +5,14 @@ import xml.etree.ElementTree
 import pathlib
 import jnius_config
 import numpy as np
+import scipy.ndimage
 import scipy.spatial.distance
 import scipy.fft
 import skimage.util
 import skimage.util.dtype
 import skimage.io
 import skimage.exposure
+import skimage.filters
 import skimage.transform
 import sklearn.linear_model
 import networkx as nx
@@ -112,6 +114,11 @@ class Metadata(object):
     @property
     def centers(self):
         return self.positions + self.size / 2
+
+    @property
+    def center(self):
+        outer_corner = np.max(self.positions + self.size, axis=0)
+        return np.mean([self.origin, outer_corner], axis=0)
 
     @property
     def origin(self):
@@ -521,6 +528,7 @@ class EdgeAligner(object):
     def run(self):
         self.make_thumbnail()
         self.check_overlaps()
+        self.identify_foreground()
         self.compute_threshold()
         self.register_all()
         self.build_spanning_tree()
@@ -549,6 +557,14 @@ class EdgeAligner(object):
             warn_data("No tiles overlap, attempting alignment anyway.")
         elif any(failures):
             warn_data("Some neighboring tiles have zero overlap.")
+
+    def identify_foreground(self):
+        energies = np.array([
+            np.linalg.norm(utils.whiten(self.reader.read(i, self.channel), 0))
+            for i in range(self.metadata.num_images)
+        ])
+        threshold = skimage.filters.threshold_otsu(energies)
+        self.foreground = energies >= threshold
 
     def compute_threshold(self):
         if self.max_error is not None:
@@ -852,6 +868,7 @@ class LayerAligner(object):
         self.max_shift_pixels = self.max_shift / self.metadata.pixel_size
         self.filter_sigma = filter_sigma
         self.verbose = verbose
+        self.cycle_angle = 0
         # FIXME Still a bit muddled here on the use of metadata positions vs.
         # corrected positions from the reference aligner. We probably want to
         # use metadata positions to find the cycle-to-cycle tile
@@ -874,20 +891,30 @@ class LayerAligner(object):
         )
 
     def coarse_align(self):
-        self.cycle_offset = thumbnail.calculate_cycle_offset(
+        self.cycle_offset, self.cycle_angle = thumbnail.align_cycles(
             self.reference_aligner.reader,
             self.reader,
             scale=self.reference_aligner.reader.thumbnail_scale,
         )
-        self.corrected_nominal_positions = self.metadata.positions + self.cycle_offset
-        reference_positions = self.reference_aligner.metadata.positions
-        dist = scipy.spatial.distance.cdist(reference_positions,
-                                            self.corrected_nominal_positions)
-        self.reference_idx = np.argmin(dist, 0)
-        self.reference_positions = reference_positions[self.reference_idx]
-        self.reference_aligner_positions = self.reference_aligner.positions[self.reference_idx]
+        mcenter = self.metadata.center
+        tform = skimage.transform.AffineTransform(
+            rotation=np.deg2rad(self.cycle_angle),
+        )
+        self.corrected_nominal_centers = (
+            tform(self.metadata.centers - mcenter) + mcenter + self.cycle_offset
+        )
+        reference_centers = self.reference_aligner.metadata.centers
+        # For small rotation angles we can use the distance between tile centers
+        # instead of computing the actual overlap between rotated rectangles.
+        dist = scipy.spatial.distance.cdist(reference_centers,
+                                            self.corrected_nominal_centers)
+        self.reference_idx = np.argmin(dist, axis=0)
+        self.reference_centers = reference_centers[self.reference_idx]
+        self.reference_aligner_centers = self.reference_aligner.centers[self.reference_idx]
 
     def register_all(self):
+        if self.cycle_angle != 0:
+            self.refine_cycle_angle()
         n = self.metadata.num_images
         self.shifts = np.empty((n, 2))
         self.errors = np.empty(n)
@@ -902,52 +929,79 @@ class LayerAligner(object):
             print()
 
     def calculate_positions(self):
-        self.positions = (
-            self.corrected_nominal_positions
+        self.centers = (
+            self.corrected_nominal_centers
             + self.shifts
-            + self.reference_aligner_positions
-            - self.reference_positions
+            + self.reference_aligner_centers
+            - self.reference_centers
         )
-        self.constrain_positions()
-        self.centers = self.positions + self.metadata.size / 2
+        self.constrain_centers()
+        self.positions = self.centers - self.metadata.size / 2
 
-    def constrain_positions(self):
-        position_diffs = np.absolute(
-            self.positions - self.reference_aligner_positions
-        )
-        # Round the diffs to one decimal point because the subpixel shifts are
-        # calculated by 10x upsampling and thus only accurate to that level.
-        position_diffs = np.rint(position_diffs * 10) / 10
-        # Discard camera background registration which will shift target
-        # positions to reference aligner positions, due to strong
-        # self-correlation of the sensor dark current pattern which dominates in
-        # low-signal images.
-        discard = (position_diffs == 0).all(axis=1)
-        # Discard any tile registration that error is infinite
-        discard |= np.isinf(self.errors)
-        # Take the median of registered shifts to determine the offset
-        # (translation) from the reference image to this one.
+    def constrain_centers(self):
+        """Correct outlier alignments by extrapolating from inliers."""
+        # We consider outliers to be any alignment that's more than
+        # max_shift_pixels away from the "prior" established by the linear model
+        # fitted in the reference aligner. TODO finish this...
+
+        # Discard alignments with infinite error.
+        self.discard_error = np.isinf(self.errors)
+        # In low-signal (background) tiles, the camera dark current image will
+        # dominate any true signal causing a spurious aligmnent at exactly 0,0
+        # with respect to the actual image dimensions. It's exceedingly unlikely
+        # to see such an alignment in real data, so we consider it a false
+        # positive and discard it. Rotation correction or gaussian filtering
+        # will destroy the dark current correlation, so in either of those cases
+        # we skip this step.
+        if self.cycle_angle == 0 and self.filter_sigma == 0:
+            position_diffs = np.absolute(
+                self.centers - self.reference_aligner_centers
+            )
+            # Round diffs to one decimal point because subpixel shifts are
+            # calculated by 10x upsampling and thus only accurate to that level.
+            position_diffs = np.rint(position_diffs * 10) / 10
+            self.discard_background = (position_diffs == 0).all(axis=1)
+        else:
+            self.discard_background = np.zeros(self.metadata.num_images, bool)
+        discard = self.discard_error | self.discard_background
+
+        # For the high-quality alignments only, take the median of registered
+        # shifts to determine the overall global offset (translation) from the
+        # reference image to this one.
         if discard.all():
             offset = 0
         else:
             offset = np.nan_to_num(np.median(self.shifts[~discard], axis=0))
+        # Recompute corrected nominal centers with refined rotation angle.
+        # TODO: Maybe refactor this to eliminate copy-paste duplication from
+        # above code in coarse_align.
+        mcenter = self.metadata.center
+        tform = skimage.transform.AffineTransform(
+            rotation=np.deg2rad(self.cycle_angle),
+        )
+        corrected_nominal_centers = (
+            tform(self.metadata.centers - mcenter) + mcenter + self.cycle_offset
+        )
         # Here we assume the fitted linear model from the reference image is
-        # still appropriate, apart from the extra offset we just computed.
-        predictions = self.reference_aligner.lr.predict(self.corrected_nominal_positions)
+        # still appropriate, apart from the rotation and the extra offset we
+        # just computed.
+        predictions = self.reference_aligner.lr.predict(
+            corrected_nominal_centers
+        )
         # Discard any tile registration that's too far from the linear model,
         # replacing it with the relevant model prediction.
-        distance = np.linalg.norm(self.positions - predictions - offset, axis=1)
-        max_dist = self.max_shift_pixels
-        extremes = distance > max_dist
-        # Recalculate the mean shift, also ignoring the extreme values.
-        discard |= extremes
+        distance = np.linalg.norm(self.centers - predictions - offset, axis=1)
+        self.discard_shift = distance > self.max_shift_pixels
+        discard |= self.discard_shift
         self.discard = discard
+
+        # Recalculate the mean shift, also ignoring the extreme values.
         if discard.all():
             self.offset = 0
         else:
             self.offset = np.nan_to_num(np.mean(self.shifts[~discard], axis=0))
         # Fill in discarded shifts from the predictions.
-        self.positions[discard] = predictions[discard] + self.offset
+        self.centers[discard] = predictions[discard] + self.offset
 
     def register(self, t):
         """Return relative shift between images and the alignment error."""
@@ -956,17 +1010,54 @@ class LayerAligner(object):
             return (0, 0), np.inf
         shift, error = utils.register(ref_img, img, self.filter_sigma)
         # Add back in the fractional position difference that overlap() loses.
+        # TODO How does rotation affect this?
         shift = tuple(shift + its.offset_diff_frac)
-        # We don't use padding and thus can skip the math to account for it.
-        assert (its.padding == 0).all(), "Unexpected non-zero padding"
+        # We don't use padding and thus can skip the math to account for it, but
+        # we will assert this just to make sure.
+        if error < np.inf and all(its.shape > 1):
+            # Skip assertion if error is infinite, indicating a degenerate
+            # Intersection that won't be usable anyway.
+            assert (its.padding == 0).all(), "Unexpected non-zero padding"
         return shift, error
 
+    def register_angle(self, t):
+        """Return relative rotation angle between images."""
+        its, ref_img, img = self.overlap(t)
+        if np.any(np.array(its.shape) <= 1):
+            return np.nan
+        angle = utils.register_angle(ref_img, img, self.filter_sigma)
+        return angle
+
+    def refine_cycle_angle(self):
+        n = self.metadata.num_images
+        ref_foreground = self.reference_aligner.foreground[self.reference_idx]
+        angles = np.empty(n)
+        for i in range(n):
+            if self.verbose:
+                sys.stdout.write("\r    aligning tile angle %d/%d" % (i + 1, n))
+                sys.stdout.flush()
+            if ref_foreground[i]:
+                angles[i] = self.register_angle(i)
+            else:
+                angles[i] = np.nan
+        if self.verbose:
+            print()
+        self.angles = angles
+        fine_adjustment = np.nanmedian(angles)
+        self.cycle_angle_coarse = self.cycle_angle
+        self.cycle_angle = self.cycle_angle_coarse + fine_adjustment
+        self.tform_rotation = skimage.transform.AffineTransform(
+            rotation=np.deg2rad(self.cycle_angle),
+        )
+        if self.verbose:
+            print(f"    refined cycle rotation = {self.cycle_angle:.2f} degrees")
+
     def intersection(self, t):
-        corners1 = np.vstack([self.reference_positions[t],
-                              self.corrected_nominal_positions[t]])
+        center_a = self.reference_centers[t]
+        center_b = self.corrected_nominal_centers[t]
+        corners1 = np.vstack([center_a, center_b]) - self.reader.metadata.size / 2
         corners2 = corners1 + self.reader.metadata.size
         its = Intersection(corners1, corners2)
-        its.shape = its.shape // 32 * 32
         return its
 
     def overlap(self, t):
@@ -976,6 +1067,10 @@ class LayerAligner(object):
             series=ref_t, c=self.reference_aligner.channel
         )
         img2 = self.reader.read(series=t, c=self.channel)
+        if self.cycle_angle != 0:
+            img2 = scipy.ndimage.rotate(
+                img2, self.cycle_angle, reshape=False
+            )
         # crop rounds the offsets to the nearest pixel, so the returned images
         # are not located at these precise locations.
         # Intersection.offset_diff_frac contains the difference.
@@ -1010,7 +1105,7 @@ class LayerAligner(object):
         plt.plot(origin[1], origin[0], 'r+')
         shift += origin - its.offset_diff_frac
         plt.plot(shift[1], shift[0], 'rx')
-        plt.tight_layout(0, 0, 0)
+        plt.tight_layout()
 
 
 class Intersection(object):
@@ -1148,13 +1243,14 @@ class Mosaic(object):
                     f"out array shape {out.shape} does not match Mosaic"
                     f" shape {self.shape}"
                 )
+        angle = getattr(self.aligner, "cycle_angle", 0)
         for si, position in enumerate(self.aligner.positions):
             if self.verbose:
                 sys.stdout.write(f"\r        merging tile {si + 1}/{num_tiles}")
                 sys.stdout.flush()
             img = self.aligner.reader.read(c=channel, series=si)
             img = self.correct_illumination(img, channel)
-            utils.paste(out, img, position, func=self.pastefunc)
+            utils.paste(out, img, position, angle, func=self.pastefunc)
         # Memory-conserving axis flips.
         if self.flip_mosaic_x:
             for i in range(len(out)):
@@ -1583,5 +1679,8 @@ def plot_layer_quality(
 def draw_mosaic_image(ax, aligner, img, **kwargs):
     if img is None:
         img = [[0]]
-    h, w = aligner.mosaic_shape
+    try:
+        h, w = aligner.mosaic_shape
+    except AttributeError:
+        h, w = aligner.reference_aligner.mosaic_shape
     ax.imshow(img, extent=(-0.5, w-0.5, h-0.5, -0.5), **kwargs)
