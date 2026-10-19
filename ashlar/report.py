@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 import seaborn as sns
 import skimage.exposure
+import skimage.transform
 import sklearn.neighbors
 
 
@@ -34,45 +35,72 @@ def generate_report(path, aligners):
 
     pdf.add_page()
     fig = plot_edge_map(aligner0, aligner0.reader.thumbnail)
-    fig.set_size_inches(7.5, 9)
+    fig.set_size_inches(7.5, 8)
     pdf.add_figure(fig, "Cycle 1: Tile pair alignment map")
     plt.close(fig)
-    add_doc_link(pdf)
+    add_legend(pdf, "edge_map")
 
     pdf.add_page()
     fig = plot_edge_quality(aligner0)
     fig.set_size_inches(7.5, 7.5)
     pdf.add_figure(fig, "Cycle 1: Tile pair alignment quality")
     plt.close(fig)
-    add_doc_link(pdf)
+    add_legend(pdf, "edge_quality")
 
     for i, aligner in enumerate(aligners, 2):
         pdf.add_page()
         fig = plot_layer_map(aligner, aligner.reader.thumbnail)
-        fig.set_size_inches(7.5, 9)
+        fig.set_size_inches(7.5, 8)
         pdf.add_figure(fig, f"Cycle {i}: Cycle alignment map")
         plt.close(fig)
-        add_doc_link(pdf)
+        add_legend(pdf, "layer_map")
 
     pdf.output(path)
 
 
-def add_doc_link(pdf):
-    pdf.write(txt="For documentation on how to interpret this plot, please see\n")
-    with pdf.local_context():
-        pdf.set_text_color(0, 0, 255)
-        pdf.set_font(style="U")
-        pdf.write(
-            txt="https://labsyspharm.github.io/ashlar/instructions/qc-report.html",
-            link="https://labsyspharm.github.io/ashlar/instructions/qc-report.html",
-        )
+LEGENDS = {
+    "edge_map": (
+        "Each node is a tile at its nominal stage position, drawn over the"
+        " cycle 1 thumbnail. Lines join overlapping neighbours, coloured by"
+        " alignment error (-log NCC; darker blue is worse). Dark grey lines"
+        " were rejected (error above the permutation threshold or shift above"
+        " --maximum-shift). Solid lines form the spanning tree used to place"
+        " tiles; dotted lines were not used. Islands of tiles with no solid"
+        " lines were placed by the linear stage model only."
+    ),
+    "edge_quality": (
+        "Each point is one neighbouring tile pair: alignment error against"
+        " the corrective shift found. The salmon curve is the error of"
+        " random non-overlapping image strips (the null distribution); the"
+        " vertical dotted line is the error threshold taken from it"
+        " (--stitch-alpha) and the horizontal one is --maximum-shift. Good"
+        " data has most pairs well left of the salmon curve. Pairs in the"
+        " salmon region are usually background-only overlaps."
+    ),
+    "layer_map": (
+        "Each node is a tile of this cycle at its nominal position over this"
+        " cycle's thumbnail, coloured by its registration shift to cycle 1."
+        " Ticks show shift direction. Dark grey nodes were discarded and"
+        " placed by the model: squares had a background reference tile,"
+        " diamonds failed to register, grey circles shifted more than"
+        " --maximum-shift from the model prediction. The dashed outline is"
+        " the cycle 1 mosaic placed by the coarse (thumbnail) alignment; if"
+        " it does not sit on the tissue, the coarse alignment failed."
+    ),
+}
+
+
+def add_legend(pdf, key):
+    with pdf.local_context(font_size=9):
+        pdf.ln(6)
+        pdf.multi_cell(w=0, text=LEGENDS[key])
 
 
 class PDF(fpdf.FPDF):
 
     def add_figure_title(self, txt):
         with self.local_context(font_size=16, font_style="B"):
-            self.cell(txt=txt, w=0, align="C", new_x="LEFT", new_y="NEXT")
+            self.cell(text=txt, w=0, align="C", new_x="LEFT", new_y="NEXT")
 
     def add_figure(self, fig, title):
         self.add_figure_title(title)
@@ -331,24 +359,27 @@ def plot_layer_map(
     g = aligner.neighbors_graph
     pos = np.fliplr(centers)
     qlen = np.repeat(np.min(aligner.metadata.size) * 0.45, len(pos))
-    qlen[aligner.discard_camera_bg | aligner.discard_error] = 0
+    qlen[aligner.discard_background | aligner.discard_error] = 0
     q_angles = np.rad2deg(np.arctan2(*(aligner.shifts * [-1, 1]).T))
-    reference_offset = (
-        aligner.cycle_offset
-        + aligner.metadata.origin
-        - aligner.reference_aligner.metadata.origin
+    # Outline of the reference (cycle 1) mosaic mapped into this cycle's frame
+    # by inverting the coarse cycle transform from LayerAligner.coarse_align.
+    ref_md = aligner.reference_aligner.metadata
+    ref_outer = np.max(ref_md.positions + ref_md.size, axis=0)
+    (y0, x0), (y1, x1) = ref_md.origin, ref_outer
+    ref_corners = np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
+    mcenter = aligner.metadata.center
+    tform = skimage.transform.AffineTransform(
+        rotation=np.deg2rad(aligner.cycle_angle)
     )
-    reference_corners = (
-        aligner.reference_aligner.metadata.centers
-        - aligner.reference_aligner.metadata.origin
-        + aligner.reference_aligner.metadata.size / 2
+    corners = (
+        tform.inverse(ref_corners - mcenter - aligner.cycle_offset)
+        + mcenter
+        - aligner.metadata.origin
     )
-    reference_size = np.max(reference_corners, axis=0)
-
     ax.add_patch(
-        mpatches.Rectangle(
-            -reference_offset[::-1],
-            *reference_size[::-1],
+        mpatches.Polygon(
+            np.fliplr(corners),
+            closed=True,
             color=mcm.Blues(0.6),
             lw=2,
             linestyle="--",
@@ -399,9 +430,13 @@ def plot_layer_map(
             **kwargs,
         )
 
-    draw_nodes(aligner.discard_camera_bg, node_shape="s")
-    draw_nodes(aligner.discard_error, node_shape="D")
-    draw_nodes(~aligner.discard | aligner.discard_distance, node_shape="o")
+    draw_nodes(aligner.discard_background, node_shape="s")
+    draw_nodes(
+        aligner.discard_error & ~aligner.discard_background, node_shape="D"
+    )
+    draw_nodes(
+        ~(aligner.discard_background | aligner.discard_error), node_shape="o"
+    )
     draw_labels(aligner.discard, font_color="gray")
     draw_labels(~aligner.discard, font_color="k")
     draw_borders(ax, aligner, pos)

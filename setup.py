@@ -10,7 +10,7 @@ import versioneer
 requires = [
     'numpy>=1.18.1,<2',
     'pyjnius>=1.2.1',
-    'matplotlib>=3.1.2',
+    'matplotlib>=3.4',
     'networkx>=2.4',
     'scipy>=1.4.1',
     'scikit-image>=0.19.2',
@@ -19,7 +19,7 @@ requires = [
     'zarr>=2.11.3',
     'blessed>=1.17',
     'Pillow>=9.0.0',
-    'fpdf2>=2.7.5',
+    'fpdf2>=2.7.6',
     'seaborn>=0.12.2',
 ]
 
