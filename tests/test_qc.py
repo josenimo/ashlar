@@ -235,3 +235,13 @@ def test_model_prediction_is_unbiased_under_stage_scale():
     assert usable.sum() >= 3
     # Without stage jitter every tile sits on the model; the bias was ~5 px.
     assert la.model_distance[usable].max() < 1
+
+
+def test_pdf_report_survives_non_latin1_warnings(aligners, tmp_path):
+    # Ashlar's own unit warning uses Greek mu, which the core PDF fonts lack.
+    path = tmp_path / "report.pdf"
+    summary = qc.summarize(
+        aligners, warnings=["Stage coordinates' unit is undefined; assuming μm."]
+    )
+    report.generate_report(str(path), aligners, summary)
+    assert path.read_bytes()[:4] == b"%PDF"

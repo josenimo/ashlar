@@ -93,6 +93,12 @@ def generate_report(path, aligners, summary=None):
     pdf.output(path)
 
 
+def pdf_text(text):
+    """Fold text into the core PDF fonts' Latin-1 range (Ashlar warns with Greek mu)."""
+    text = str(text).replace("\u03bc", "\u00b5")
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
 def fmt(v, spec=".3g"):
     if v is None:
         return "-"
@@ -170,7 +176,7 @@ def add_summary(pdf, summary):
             with pdf.local_context(font_style="B"):
                 pdf.cell(text="Warnings", new_x="LEFT", new_y="NEXT")
             for w in summary["warnings"]:
-                pdf.multi_cell(w=0, text=f"- {w}")
+                pdf.multi_cell(w=0, text=pdf_text(f"- {w}"))
         pdf.ln(6)
         add_legend(pdf, "summary")
 

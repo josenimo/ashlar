@@ -1,5 +1,6 @@
 import warnings
 import sys
+import traceback
 import re
 import argparse
 import pathlib
@@ -312,20 +313,30 @@ def process_single(
     # Write QC before the (slow) mosaic so it survives a failed write.
     aligners = [m.aligner for m in mosaics]
     qc_kwargs = dict(
-        filepaths=filepaths, args=qc_args,
-        warnings=[str(w.message) for w in captured_warnings],
+        filepaths=filepaths, args=qc_args, warnings=unique_warnings(),
     )
+    # QC must never cost the mosaic: report a failure and carry on writing.
+    summary = None
     if qc_path:
         if not quiet:
             print()
             print(f"Writing QC output to {qc_path}")
-        summary = write_qc(qc_path, aligners, **qc_kwargs)
-    elif report_path:
-        summary = summarize(aligners, **qc_kwargs)
+        try:
+            summary = write_qc(qc_path, aligners, **qc_kwargs)
+        except Exception:
+            traceback.print_exc()
+            print_error("QC output failed; continuing with the mosaic")
     if report_path:
         if not quiet:
             print(f"Writing QC report to {report_path}")
-        generate_report(report_path, aligners, summary)
+        try:
+            generate_report(
+                report_path, aligners,
+                summary or summarize(aligners, **qc_kwargs),
+            )
+        except Exception:
+            traceback.print_exc()
+            print_error("QC report failed; continuing with the mosaic")
 
     # Disable reader caching to save memory during mosaicing and writing.
     if hasattr(edge_aligner.reader, "thumbnail"):
@@ -477,6 +488,14 @@ def configure_warning_format():
     warnings.formatwarning = warning_formatter
     _old_showwarning = warnings.showwarning
     warnings.showwarning = record_warning
+
+
+def unique_warnings():
+    """Captured warning texts, repeats folded into one line with a count."""
+    counts = {}
+    for w in captured_warnings:
+        counts[str(w.message)] = counts.get(str(w.message), 0) + 1
+    return [m if n == 1 else f"{m} (x{n})" for m, n in counts.items()]
 
 
 def record_warning(message, category, filename, lineno, file=None, line=None):
