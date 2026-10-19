@@ -37,7 +37,8 @@ def main(argv=sys.argv):
         '-c', '--align-channel', dest='align_channel', type=int,
         default='0', metavar='CHANNEL',
         help=('Reference channel number for image alignment. Numbering starts'
-              ' at 0.'),
+              ' at 0; negative values count from the last channel of each'
+              ' cycle.'),
     )
     parser.add_argument(
         '--flip-x', default=False, action='store_true',
@@ -264,6 +265,8 @@ def process_single(
     reader = build_reader(filepaths[0], barrel_correction, plate_well=plate_well)
     process_axis_flip(reader, flip_x, flip_y)
     ea_args = aligner_args.copy()
+    # Copy so plate mode passes the stitching-only args to every well.
+    aligner_args = aligner_args.copy()
     for arg in ("alpha", "max_error"):
         aligner_args.pop(arg, None)
     # Skip thumbnail unless 2+ cycles or report is enabled.

@@ -624,7 +624,7 @@ class EdgeAligner(object):
             else:
                 # Retries exhausted. This should be very rare.
                 warn_data(
-                    "Could not find non-overlapping strips in {max_tries} tries"
+                    f"Could not find non-overlapping strips in {max_tries} tries"
                 )
             pairs[i] = t1, t2
             offsets[i] = o1, o2
@@ -1444,7 +1444,8 @@ class TiffListWriter:
                     tiff.write(
                         data=img,
                         software=software.encode("utf-8"),
-                        resolution=(resolution_cm, resolution_cm, "centimeter"),
+                        resolution=(resolution_cm, resolution_cm),
+                        resolutionunit="centimeter",
                         # FIXME Propagate this from input files (especially RGB).
                         photometric="minisblack",
                     )
