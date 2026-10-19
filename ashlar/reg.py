@@ -985,8 +985,11 @@ class LayerAligner(object):
         # Here we assume the fitted linear model from the reference image is
         # still appropriate, apart from the rotation and the extra offset we
         # just computed.
-        predictions = self.reference_aligner.lr.predict(
-            corrected_nominal_centers
+        # The model maps top-left positions, so predict from those, not centers.
+        half = self.metadata.size / 2
+        predictions = (
+            self.reference_aligner.lr.predict(corrected_nominal_centers - half)
+            + half
         )
         # Discard any tile registration that's too far from the linear model,
         # replacing it with the relevant model prediction.

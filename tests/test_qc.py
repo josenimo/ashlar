@@ -68,13 +68,14 @@ def texture(shape, seed=0):
     return (img / img.max() * 60000).astype(np.uint16)
 
 
-def make_cycle(image, offset, angle, seed):
-    nominal = np.array(
+def make_cycle(image, offset, angle, seed, stage_scale=1.0, jitter=3):
+    true_grid = np.array(
         [[r * STEP, c * STEP] for r in range(GRID) for c in range(GRID)], float
     )
+    # stage_scale < 1 means the stage reports wider spacing than the pixels show.
+    nominal = true_grid / stage_scale
     rng = np.random.default_rng(seed)
-    jitter = rng.uniform(-3, 3, nominal.shape)
-    true = nominal + 40 + jitter + offset
+    true = true_grid + 40 + rng.uniform(-jitter, jitter, nominal.shape) + offset
     if angle:
         image = scipy.ndimage.rotate(image, angle, reshape=False, order=1)
     return ArrayReader(image, nominal, true, seed)
@@ -217,3 +218,20 @@ def test_pdf_report(aligners, tmp_path):
     path = tmp_path / "report.pdf"
     report.generate_report(str(path), aligners)
     assert path.read_bytes()[:4] == b"%PDF"
+
+
+def test_model_prediction_is_unbiased_under_stage_scale():
+    # The stitching model is fitted on top-left positions; applying it to tile
+    # centres used to add (scale - 1) * size / 2 to every prediction.
+    image = texture((STEP * GRID + 200, STEP * GRID + 200))
+    ea = reg.EdgeAligner(make_cycle(image, (0, 0), 0, 1, 0.95, 0), channel=0)
+    ea.run()
+    assert ea.lr.coef_[0, 0] < 0.98
+    la = reg.LayerAligner(
+        make_cycle(image, (12, -7), 0, 2, 0.95, 0), ea, channel=0, max_shift=20
+    )
+    la.run()
+    usable = ~(la.discard_error | la.discard_background)
+    assert usable.sum() >= 3
+    # Without stage jitter every tile sits on the model; the bias was ~5 px.
+    assert la.model_distance[usable].max() < 1
