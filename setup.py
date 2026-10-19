@@ -8,7 +8,7 @@ from setuptools.command.build_py import build_py
 import versioneer
 
 requires = [
-    'numpy>=1.18.1',
+    'numpy>=1.18.1,<2',
     'pyjnius>=1.2.1',
     'matplotlib>=3.1.2',
     'networkx>=2.4',
@@ -18,6 +18,9 @@ requires = [
     'tifffile>=2023.3.15',
     'zarr>=2.11.3',
     'blessed>=1.17',
+    'Pillow>=9.0.0',
+    'fpdf2>=2.7.5',
+    'seaborn>=0.12.2',
 ]
 
 

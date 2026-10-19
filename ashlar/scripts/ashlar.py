@@ -9,6 +9,7 @@ from .. import reg
 from ..reg import PlateReader, BioformatsReader
 from ..filepattern import FilePatternReader
 from ..fileseries import FileSeriesReader
+from ..report import generate_report
 from ..zen import ZenReader
 
 
@@ -110,6 +111,11 @@ def main(argv=sys.argv):
         help='Enable plate mode for HTS data',
     )
     parser.add_argument(
+        "--report", metavar="FILE", type=str_file_pdf,
+        help=("Generate quality control report in FILE in PDF format. FILE"
+              " must end in .pdf (default: no report)"),
+    )
+    parser.add_argument(
         '-q', '--quiet', dest='quiet', default=False,
         action='store_true', help='Suppress progress display',
     )
@@ -174,6 +180,10 @@ def main(argv=sys.argv):
         print_error("--tile-size can only be used with OME-TIFF output")
         return 1
 
+    if args.plates and args.report:
+        print_error("--plates and --report cannot be used together yet")
+        return 1
+
     ffp_paths = args.ffp
     if ffp_paths:
         if len(ffp_paths) not in (0, 1, len(filepaths)):
@@ -226,7 +236,7 @@ def main(argv=sys.argv):
             return process_single(
                 filepaths, mosaic_path_format, args.flip_x, args.flip_y,
                 ffp_paths, dfp_paths, args.barrel_correction, aligner_args,
-                mosaic_args, args.pyramid, args.quiet
+                mosaic_args, args.pyramid, args.report, args.quiet
             )
     except ProcessingError as e:
         print_error(str(e))
@@ -235,7 +245,7 @@ def main(argv=sys.argv):
 
 def process_single(
     filepaths, output_path_format, flip_x, flip_y, ffp_paths, dfp_paths,
-    barrel_correction, aligner_args, mosaic_args, pyramid, quiet,
+    barrel_correction, aligner_args, mosaic_args, pyramid, report_path, quiet,
     plate_well=None
 ):
 
@@ -256,7 +266,8 @@ def process_single(
     ea_args = aligner_args.copy()
     for arg in ("alpha", "max_error"):
         aligner_args.pop(arg, None)
-    if len(filepaths) == 1:
+    # Skip thumbnail unless 2+ cycles or report is enabled.
+    if len(filepaths) == 1 and report_path is None:
         ea_args['do_make_thumbnail'] = False
     edge_aligner = reg.EdgeAligner(reader, **ea_args)
     edge_aligner.run()
@@ -284,6 +295,8 @@ def process_single(
         mosaics.append(reg.Mosaic(layer_aligner, mshape, **mosaic_args_final))
 
     # Disable reader caching to save memory during mosaicing and writing.
+    if hasattr(edge_aligner.reader, "thumbnail"):
+        edge_aligner.reader.reader.thumbnail = edge_aligner.reader.thumbnail
     edge_aligner.reader = edge_aligner.reader.reader
 
     if not quiet:
@@ -294,6 +307,9 @@ def process_single(
         mosaics, output_path_format, verbose=not quiet, **writer_args
     )
     writer.run()
+
+    if report_path:
+        generate_report(report_path, [m.aligner for m in mosaics])
 
     return 0
 
@@ -325,7 +341,7 @@ def process_plates(
                 process_single(
                     filepaths, mosaic_path_format, flip_x, flip_y,
                     ffp_paths, dfp_paths, barrel_correction, aligner_args,
-                    mosaic_args, pyramid, quiet, plate_well=(p, w)
+                    mosaic_args, pyramid, None, quiet, plate_well=(p, w)
                 )
             else:
                 print("Skipping -- No images found.")
@@ -436,6 +452,12 @@ class HelpFormatter(argparse.HelpFormatter):
             if action.option_strings or action.nargs in defaulting_nargs:
                 help += " (default: %(default)s)"
         return help
+
+
+def str_file_pdf(v):
+    if not re.search(r"\.pdf$", v):
+        raise argparse.ArgumentTypeError(f"path does not end in .pdf: '{v}'")
+    return v
 
 
 class ProcessingError(RuntimeError):
