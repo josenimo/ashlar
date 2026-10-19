@@ -31,7 +31,23 @@ def write_qc(path, aligners, filepaths=None, args=None, warnings=None):
     path = pathlib.Path(path)
     path.mkdir(parents=True, exist_ok=True)
     edge_aligner, *layer_aligners = aligners
-    summary = {
+    summary = summarize(aligners, filepaths, args, warnings)
+    write_edges(path / "edges.csv", edge_aligner)
+    write_tiles(path / "tiles.csv", edge_aligner, layer_aligners)
+    write_column(
+        path / "null_errors.csv", "error", edge_aligner.errors_negative_sampled
+    )
+    summary["images"] = write_images(path, edge_aligner, layer_aligners)
+    with open(path / "qc.json", "w") as f:
+        json.dump(clean(summary), f, indent=2, allow_nan=False)
+        f.write("\n")
+    return summary
+
+
+def summarize(aligners, filepaths=None, args=None, warnings=None):
+    """Return the qc.json summary dict (numpy values not yet cleaned)."""
+    edge_aligner, *layer_aligners = aligners
+    return {
         "schema_version": SCHEMA_VERSION,
         "ashlar_version": _version,
         "args": args or {},
@@ -46,16 +62,6 @@ def write_qc(path, aligners, filepaths=None, args=None, warnings=None):
             for cycle, la in enumerate(layer_aligners, 1)
         ],
     }
-    write_edges(path / "edges.csv", edge_aligner)
-    write_tiles(path / "tiles.csv", edge_aligner, layer_aligners)
-    write_column(
-        path / "null_errors.csv", "error", edge_aligner.errors_negative_sampled
-    )
-    summary["images"] = write_images(path, edge_aligner, layer_aligners)
-    with open(path / "qc.json", "w") as f:
-        json.dump(clean(summary), f, indent=2, allow_nan=False)
-        f.write("\n")
-    return summary
 
 
 def stitching_summary(ea):

@@ -17,6 +17,8 @@ import skimage.exposure
 import skimage.transform
 import sklearn.neighbors
 
+from . import qc
+
 
 cmap_yellow = mcolors.LinearSegmentedColormap(
     name="a_yellow",
@@ -28,10 +30,16 @@ cmap_yellow = mcolors.LinearSegmentedColormap(
 )
 
 
-def generate_report(path, aligners):
+def generate_report(path, aligners, summary=None):
     aligner0, *aligners = aligners
+    if summary is None:
+        summary = qc.summarize([aligner0, *aligners])
+    summary = qc.clean(summary)
     pdf = PDF(unit="pt", format="letter")
     pdf.set_font("Helvetica")
+
+    pdf.add_page()
+    add_summary(pdf, summary)
 
     pdf.add_page()
     fig = plot_edge_map(aligner0, aligner0.reader.thumbnail)
@@ -47,6 +55,17 @@ def generate_report(path, aligners):
     plt.close(fig)
     add_legend(pdf, "edge_quality")
 
+    if hasattr(aligner0, "foreground_energy"):
+        pdf.add_page()
+        fig = plot_foreground(aligner0, aligner0.reader.thumbnail)
+        fig.set_size_inches(7.5, 8)
+        pdf.add_figure(fig, "Cycle 1: Foreground tiles")
+        plt.close(fig)
+        add_legend(pdf, "foreground")
+
+    scale = aligner0.reader.thumbnail_scale
+    shape = np.ceil(np.array(aligner0.mosaic_shape) * scale).astype(int)
+    ref_thumb = qc.registered_thumbnail(aligner0, shape, scale)
     for i, aligner in enumerate(aligners, 2):
         pdf.add_page()
         fig = plot_layer_map(aligner, aligner.reader.thumbnail)
@@ -55,10 +74,150 @@ def generate_report(path, aligners):
         plt.close(fig)
         add_legend(pdf, "layer_map")
 
+        pdf.add_page()
+        thumb = qc.registered_thumbnail(aligner, shape, scale)
+        fig = plot_overlay(ref_thumb, thumb)
+        fig.set_size_inches(7.5, 8)
+        pdf.add_figure(fig, f"Cycle {i}: Registered overlay on cycle 1")
+        plt.close(fig)
+        add_legend(pdf, "overlay")
+
+        if getattr(aligner, "angles", None) is not None:
+            pdf.add_page()
+            fig = plot_layer_angles(aligner, aligner.reader.thumbnail)
+            fig.set_size_inches(7.5, 8)
+            pdf.add_figure(fig, f"Cycle {i}: Per-tile rotation")
+            plt.close(fig)
+            add_legend(pdf, "angles")
+
     pdf.output(path)
 
 
+def fmt(v, spec=".3g"):
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return format(v, spec)
+    return str(v)
+
+
+def add_summary(pdf, summary):
+    st = summary["stitching"]
+    pdf.add_figure_title("ASHLAR stitching and registration QC")
+    with pdf.local_context(font_size=9):
+        pdf.ln(4)
+        pdf.multi_cell(
+            w=0,
+            text=(
+                f"ashlar {summary['ashlar_version']}. Cycle numbers start at"
+                " 1 here (qc.json and the CSV files count from 0). Lengths in"
+                " \xb5m unless stated. Errors are -log NCC (lower is better)."
+            ),
+        )
+        pdf.ln(4)
+        sm = st["stage_model"]
+        rows = [
+            ("Tiles", fmt(st["n_tiles"])),
+            ("Pixel size (\xb5m)", fmt(summary["pixel_size_um"], ".4g")),
+            ("Mosaic shape (px)", " x ".join(map(str, summary["mosaic_shape"]))),
+            ("Neighbour pairs", fmt(st["n_edges"])),
+            ("  accepted", fmt(st["n_edges_accepted"])),
+            ("  rejected: error above threshold", fmt(st["n_edges_rejected_error"])),
+            ("  rejected: shift above max", fmt(st["n_edges_rejected_shift"])),
+            ("Error threshold (null p%g)" % (st["alpha"] * 100), fmt(st["max_error"])),
+            ("Pair error p50 / null p50",
+             f"{fmt(st['edge_error_percentiles']['p50'])} / "
+             f"{fmt(st['null_error_percentiles']['p50'])}"),
+            ("Pairs no better than random", fmt(st["edges_like_null_fraction"], ".0%")),
+            ("Spanning tree components", fmt(st["n_components"])),
+            ("Tiles outside largest component",
+             fmt(st["n_tiles_outside_largest_component"])),
+            ("Stage scale y / x",
+             f"{fmt(sm['scale_y'], '.4f')} / {fmt(sm['scale_x'], '.4f')}"),
+            ("Stage rotation / shear (deg)",
+             f"{fmt(sm['rotation_deg'], '.3f')} / {fmt(sm['shear_deg'], '.3f')}"),
+            ("Tile residual from stage model p50 / p95",
+             f"{fmt(st['model_residual_um_percentiles']['p50'])} / "
+             f"{fmt(st['model_residual_um_percentiles']['p95'])}"),
+            ("Foreground tiles", fmt(st["n_foreground_tiles"])),
+        ]
+        add_table(pdf, ("Cycle 1 stitching", ""), rows, (3, 2))
+        if summary["registration"]:
+            pdf.ln(8)
+            header = (
+                "Cycle", "Offset y, x", "Angle (deg)", "Tile angle MAD",
+                "Discarded (err/bg/shift)", "Kept like null",
+                "Residual p50 / p95",
+            )
+            rows = []
+            for r in summary["registration"]:
+                off = r["cycle_offset_um"]
+                res = r["residual_um_percentiles"]
+                rows.append((
+                    str(r["cycle"] + 1),
+                    f"{fmt(off[0], '.1f')}, {fmt(off[1], '.1f')}",
+                    fmt(r["cycle_angle"], ".2f"),
+                    fmt(r["tile_angle_mad"], ".2f"),
+                    f"{r['n_discard']}/{r['n_tiles']} "
+                    f"({r['n_discard_error']}/{r['n_discard_background']}/"
+                    f"{r['n_discard_shift']})",
+                    fmt(r["n_kept_like_null"]),
+                    f"{fmt(res['p50'])} / {fmt(res['p95'])}",
+                ))
+            add_table(pdf, header, rows, (1, 2, 1.5, 1.5, 2.5, 1.5, 2))
+        if summary["warnings"]:
+            pdf.ln(8)
+            with pdf.local_context(font_style="B"):
+                pdf.cell(text="Warnings", new_x="LEFT", new_y="NEXT")
+            for w in summary["warnings"]:
+                pdf.multi_cell(w=0, text=f"- {w}")
+        pdf.ln(6)
+        add_legend(pdf, "summary")
+
+
+def add_table(pdf, header, rows, widths):
+    with pdf.table(col_widths=widths, text_align="LEFT", line_height=11) as t:
+        row = t.row()
+        for h in header:
+            row.cell(h)
+        for r in rows:
+            row = t.row()
+            for v in r:
+                row.cell(v)
+
+
 LEGENDS = {
+    "summary": (
+        "Offsets are the coarse cycle-to-cycle translation from thumbnail"
+        " correlation. Discarded tiles were placed by the stage model:"
+        " err = registration failed, bg = reference tile is background,"
+        " shift = registered too far from the model. 'Kept like null' counts"
+        " kept tiles whose error is no better than the cycle 1 threshold, so"
+        " their registration may be spurious. Residual is each usable tile's"
+        " distance from the rigid model prediction."
+    ),
+    "foreground": (
+        "Tiles coloured by image energy (norm of the Laplacian-whitened"
+        " alignment channel). Tiles below the Otsu threshold (inset, dashed"
+        " line) count as background: they are skipped for rotation"
+        " refinement and their later-cycle registrations are discarded."
+        " Otsu always splits the tiles in two, so on a slide that is all"
+        " tissue some real tissue tiles are marked background."
+    ),
+    "overlay": (
+        "Cycle 1 (magenta) and this cycle (green) at their final registered"
+        " positions, built from the thumbnails. Well-registered tissue is"
+        " white or grey; colour fringes or doubled structures mean"
+        " misregistration. Black areas lie outside this cycle's coverage."
+    ),
+    "angles": (
+        "Residual rotation of each tile against its cycle 1 reference after"
+        " the coarse cycle rotation, at nominal positions (left), and their"
+        " distribution (right). The cycle rotation is refined by the median"
+        " shown as the dashed line. A wide spread or spatial trend suggests"
+        " non-rigid deformation that a single rotation cannot correct."
+        " Background tiles are not measured."
+    ),
     "edge_map": (
         "Each node is a tile at its nominal stage position, drawn over the"
         " cycle 1 thumbnail. Lines join overlapping neighbours, coloured by"
@@ -105,10 +264,13 @@ class PDF(fpdf.FPDF):
     def add_figure(self, fig, title):
         self.add_figure_title(title)
         if fig.findobj(mimage.AxesImage):
-            fig.set_dpi(300)
+            fig.set_dpi(200)
             canvas = FigureCanvasAgg(fig)
             canvas.draw()
-            img = Image.fromarray(np.asarray(canvas.buffer_rgba()))
+            rgb = Image.fromarray(np.asarray(canvas.buffer_rgba())).convert("RGB")
+            # JPEG keeps image-heavy pages to a few hundred kB each.
+            img = io.BytesIO()
+            rgb.save(img, format="JPEG", quality=85)
         else:
             img = io.BytesIO()
             fig.savefig(img, format="svg")
@@ -454,6 +616,101 @@ def plot_layer_map(
     ax.margins(0)
     fig.tight_layout()
 
+    return fig
+
+
+def plot_foreground(aligner, img=None, cmap=None, im_kwargs=None):
+    """Plot tiles coloured by foreground energy with the Otsu threshold."""
+    centers = aligner.metadata.centers - aligner.metadata.origin
+    cmap = cmap or cmap_yellow
+    im_kwargs = im_kwargs or {}
+    fig, ax = plt.subplots()
+    draw_mosaic_image(ax, aligner, img, cmap=cmap, **im_kwargs)
+    energy = aligner.foreground_energy
+    threshold = aligner.foreground_threshold
+    node_cmap = mcm.RdBu_r
+    norm = mcolors.TwoSlopeNorm(
+        vcenter=threshold,
+        vmin=min(energy.min(), threshold - 1e-9),
+        vmax=max(energy.max(), threshold + 1e-9),
+    )
+    pos = np.fliplr(centers)
+    diameter = nx.diameter(aligner.neighbors_graph)
+    interp = functools.partial(np.interp, diameter, [10, 60])
+    for fg, marker in ((True, "o"), (False, "s")):
+        sel = aligner.foreground == fg
+        ax.scatter(
+            *pos[sel].T, c=energy[sel], cmap=node_cmap, norm=norm,
+            s=interp([100, 8]), marker=marker, edgecolors="k", linewidths=0.3,
+        )
+    draw_borders(ax, aligner, pos)
+    fig.colorbar(
+        mcm.ScalarMappable(norm, node_cmap), label="Energy", location="right",
+        shrink=0.5, ax=ax,
+    )
+    inset = ax.inset_axes([0.0, -0.22, 0.4, 0.16])
+    inset.hist(energy, bins=30, color="tab:gray")
+    inset.axvline(threshold, c="k", ls="--")
+    inset.set_xlabel("Energy", fontsize=7)
+    inset.tick_params(labelsize=6)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_frame_on(False)
+    ax.margins(0)
+    fig.tight_layout()
+    return fig
+
+
+def plot_overlay(ref, img):
+    """Show the magenta/green overlay of two registered thumbnails."""
+    fig, ax = plt.subplots()
+    ax.imshow(qc.overlay(ref, img), interpolation="none")
+    ax.set_axis_off()
+    fig.tight_layout()
+    return fig
+
+
+def plot_layer_angles(aligner, img=None, cmap=None, im_kwargs=None):
+    """Plot per-tile residual rotation angles as a map and histogram."""
+    centers = aligner.metadata.centers - aligner.metadata.origin
+    cmap = cmap or cmap_yellow
+    im_kwargs = im_kwargs or {}
+    angles = aligner.angles
+    finite = np.isfinite(angles)
+    median = np.nanmedian(angles) if finite.any() else 0
+    fig, (ax, hax) = plt.subplots(
+        1, 2, gridspec_kw={"width_ratios": [3, 1]}
+    )
+    draw_mosaic_image(ax, aligner, img, cmap=cmap, **im_kwargs)
+    pos = np.fliplr(centers)
+    lim = max(np.nanmax(np.abs(angles - median)) if finite.any() else 0, 0.05)
+    node_cmap = mcm.PuOr
+    norm = mcolors.Normalize(median - lim, median + lim)
+    diameter = nx.diameter(aligner.neighbors_graph)
+    size = np.interp(diameter, [10, 60], [100, 8])
+    ax.scatter(
+        *pos[finite].T, c=angles[finite], cmap=node_cmap, norm=norm, s=size,
+        edgecolors="k", linewidths=0.3,
+    )
+    ax.scatter(*pos[~finite].T, c="#333333", s=size * 0.5, marker="s")
+    draw_borders(ax, aligner, pos)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_frame_on(False)
+    ax.margins(0)
+    fig.colorbar(
+        mcm.ScalarMappable(norm, node_cmap), label="Residual angle (deg)",
+        location="bottom", shrink=0.6, ax=ax,
+    )
+    hax.hist(angles[finite], bins=30, orientation="horizontal", color="tab:gray")
+    hax.axhline(median, c="k", ls="--")
+    hax.set_ylabel("Residual angle (deg)")
+    hax.set_title(
+        f"cycle angle {aligner.cycle_angle:.2f}\n"
+        f"(coarse {getattr(aligner, 'cycle_angle_coarse', np.nan):.2f})",
+        fontsize=8,
+    )
+    fig.tight_layout()
     return fig
 
 

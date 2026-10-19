@@ -10,7 +10,7 @@ from ..reg import PlateReader, BioformatsReader
 from ..filepattern import FilePatternReader
 from ..fileseries import FileSeriesReader
 from ..report import generate_report
-from ..qc import write_qc
+from ..qc import summarize, write_qc
 from ..zen import ZenReader
 
 
@@ -311,18 +311,21 @@ def process_single(
 
     # Write QC before the (slow) mosaic so it survives a failed write.
     aligners = [m.aligner for m in mosaics]
+    qc_kwargs = dict(
+        filepaths=filepaths, args=qc_args,
+        warnings=[str(w.message) for w in captured_warnings],
+    )
     if qc_path:
         if not quiet:
             print()
             print(f"Writing QC output to {qc_path}")
-        write_qc(
-            qc_path, aligners, filepaths=filepaths, args=qc_args,
-            warnings=[str(w.message) for w in captured_warnings],
-        )
+        summary = write_qc(qc_path, aligners, **qc_kwargs)
+    elif report_path:
+        summary = summarize(aligners, **qc_kwargs)
     if report_path:
         if not quiet:
             print(f"Writing QC report to {report_path}")
-        generate_report(report_path, aligners)
+        generate_report(report_path, aligners, summary)
 
     # Disable reader caching to save memory during mosaicing and writing.
     if hasattr(edge_aligner.reader, "thumbnail"):
