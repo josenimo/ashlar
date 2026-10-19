@@ -1,5 +1,6 @@
 import sys
 import math
+import time
 import warnings
 import xml.etree.ElementTree
 import pathlib
@@ -522,14 +523,16 @@ class EdgeAligner(object):
     neighbors_graph = neighbors_graph
 
     def run(self):
-        self.make_thumbnail()
-        self.check_overlaps()
-        self.identify_foreground()
-        self.compute_threshold()
-        self.register_all()
-        self.build_spanning_tree()
-        self.calculate_positions()
-        self.fit_model()
+        self.timings = {}
+        steps = [
+            self.make_thumbnail, self.check_overlaps, self.identify_foreground,
+            self.compute_threshold, self.register_all,
+            self.build_spanning_tree, self.calculate_positions, self.fit_model,
+        ]
+        for step in steps:
+            t0 = time.perf_counter()
+            step()
+            self.timings[step.__name__] = time.perf_counter() - t0
 
     def make_thumbnail(self):
         if not self.do_make_thumbnail:
@@ -561,6 +564,9 @@ class EdgeAligner(object):
         ])
         threshold = skimage.filters.threshold_otsu(energies)
         self.foreground = energies >= threshold
+        # Kept for QC output.
+        self.foreground_energy = energies
+        self.foreground_threshold = threshold
 
     def compute_threshold(self):
         if self.max_error is not None:
@@ -653,9 +659,16 @@ class EdgeAligner(object):
         if self.verbose:
             print()
         self.all_errors = np.array([x[1] for x in self._cache.values()])
-        # Set error values above the threshold to infinity.
+        # Set error values above the threshold to infinity, recording why.
+        self.edge_reject = {}
         for k, v in self._cache.items():
-            if v[1] > self.max_error or any(np.abs(v[0]) > self.max_shift_pixels):
+            bad_error = bool(v[1] > self.max_error)
+            bad_shift = bool(any(np.abs(v[0]) > self.max_shift_pixels))
+            self.edge_reject[k] = {
+                (False, False): "none", (True, False): "error",
+                (False, True): "shift", (True, True): "both",
+            }[bad_error, bad_shift]
+            if bad_error or bad_shift:
                 self._cache[k] = (v[0], np.inf)
 
     def build_spanning_tree(self):
@@ -875,10 +888,15 @@ class LayerAligner(object):
     neighbors_graph = neighbors_graph
 
     def run(self):
-        self.make_thumbnail()
-        self.coarse_align()
-        self.register_all()
-        self.calculate_positions()
+        self.timings = {}
+        steps = [
+            self.make_thumbnail, self.coarse_align, self.register_all,
+            self.calculate_positions,
+        ]
+        for step in steps:
+            t0 = time.perf_counter()
+            step()
+            self.timings[step.__name__] = time.perf_counter() - t0
 
     def make_thumbnail(self):
         self.reader.thumbnail = thumbnail.make_thumbnail(
@@ -974,6 +992,8 @@ class LayerAligner(object):
         # replacing it with the relevant model prediction.
         distance = np.linalg.norm(self.centers - predictions - offset, axis=1)
         self.discard_shift = distance > self.max_shift_pixels
+        # Kept for QC output: per-tile distance from the model, in pixels.
+        self.model_distance = distance
         discard |= self.discard_shift
         self.discard = discard
 

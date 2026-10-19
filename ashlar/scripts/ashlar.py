@@ -10,6 +10,7 @@ from ..reg import PlateReader, BioformatsReader
 from ..filepattern import FilePatternReader
 from ..fileseries import FileSeriesReader
 from ..report import generate_report
+from ..qc import write_qc
 from ..zen import ZenReader
 
 
@@ -117,6 +118,13 @@ def main(argv=sys.argv):
               " must end in .pdf (default: no report)"),
     )
     parser.add_argument(
+        "--qc-output", metavar="DIR", type=pathlib.Path,
+        help=("Write machine-readable stitching and registration QC (JSON,"
+              " CSV and JPEG files) into DIR, creating it if needed. In plate"
+              " mode one subdirectory per well is written. (default: no QC"
+              " output)"),
+    )
+    parser.add_argument(
         '-q', '--quiet', dest='quiet', default=False,
         action='store_true', help='Suppress progress display',
     )
@@ -181,9 +189,10 @@ def main(argv=sys.argv):
         print_error("--tile-size can only be used with OME-TIFF output")
         return 1
 
-    if args.plates and args.report:
-        print_error("--plates and --report cannot be used together yet")
-        return 1
+    qc_args = {
+        k: (str(v) if isinstance(v, pathlib.Path) else v)
+        for k, v in vars(args).items()
+    }
 
     ffp_paths = args.ffp
     if ffp_paths:
@@ -230,14 +239,17 @@ def main(argv=sys.argv):
             return process_plates(
                 filepaths, output_path, args.filename_format, args.flip_x,
                 args.flip_y, ffp_paths, dfp_paths, args.barrel_correction,
-                aligner_args, mosaic_args, args.pyramid, args.quiet
+                aligner_args, mosaic_args, args.pyramid, args.quiet,
+                report_path=args.report, qc_path=args.qc_output,
+                qc_args=qc_args,
             )
         else:
             mosaic_path_format = str(output_path / args.filename_format)
             return process_single(
                 filepaths, mosaic_path_format, args.flip_x, args.flip_y,
                 ffp_paths, dfp_paths, args.barrel_correction, aligner_args,
-                mosaic_args, args.pyramid, args.report, args.quiet
+                mosaic_args, args.pyramid, args.report, args.quiet,
+                qc_path=args.qc_output, qc_args=qc_args,
             )
     except ProcessingError as e:
         print_error(str(e))
@@ -247,7 +259,7 @@ def main(argv=sys.argv):
 def process_single(
     filepaths, output_path_format, flip_x, flip_y, ffp_paths, dfp_paths,
     barrel_correction, aligner_args, mosaic_args, pyramid, report_path, quiet,
-    plate_well=None
+    plate_well=None, qc_path=None, qc_args=None
 ):
 
     mosaic_args = mosaic_args.copy()
@@ -269,8 +281,8 @@ def process_single(
     aligner_args = aligner_args.copy()
     for arg in ("alpha", "max_error"):
         aligner_args.pop(arg, None)
-    # Skip thumbnail unless 2+ cycles or report is enabled.
-    if len(filepaths) == 1 and report_path is None:
+    # Skip thumbnail unless 2+ cycles, report or QC output is enabled.
+    if len(filepaths) == 1 and report_path is None and qc_path is None:
         ea_args['do_make_thumbnail'] = False
     edge_aligner = reg.EdgeAligner(reader, **ea_args)
     edge_aligner.run()
@@ -297,6 +309,21 @@ def process_single(
             mosaic_args_final['dfp_path'] = dfp_paths[cycle]
         mosaics.append(reg.Mosaic(layer_aligner, mshape, **mosaic_args_final))
 
+    # Write QC before the (slow) mosaic so it survives a failed write.
+    aligners = [m.aligner for m in mosaics]
+    if qc_path:
+        if not quiet:
+            print()
+            print(f"Writing QC output to {qc_path}")
+        write_qc(
+            qc_path, aligners, filepaths=filepaths, args=qc_args,
+            warnings=[str(w.message) for w in captured_warnings],
+        )
+    if report_path:
+        if not quiet:
+            print(f"Writing QC report to {report_path}")
+        generate_report(report_path, aligners)
+
     # Disable reader caching to save memory during mosaicing and writing.
     if hasattr(edge_aligner.reader, "thumbnail"):
         edge_aligner.reader.reader.thumbnail = edge_aligner.reader.thumbnail
@@ -311,15 +338,13 @@ def process_single(
     )
     writer.run()
 
-    if report_path:
-        generate_report(report_path, [m.aligner for m in mosaics])
-
     return 0
 
 
 def process_plates(
     filepaths, output_path, filename_format, flip_x, flip_y, ffp_paths,
-    dfp_paths, barrel_correction, aligner_args, mosaic_args, pyramid, quiet
+    dfp_paths, barrel_correction, aligner_args, mosaic_args, pyramid, quiet,
+    report_path=None, qc_path=None, qc_args=None
 ):
 
     temp_reader = build_reader(filepaths[0])
@@ -341,10 +366,20 @@ def process_plates(
                     out_file_path = plate_path / well_name / filename_format
                 out_file_path.parent.mkdir(parents=True, exist_ok=True)
                 mosaic_path_format = str(out_file_path)
+                well_report = None
+                if report_path:
+                    rp = pathlib.Path(report_path)
+                    well_report = str(
+                        rp.with_name(f"{plate_name}_{well_name}_{rp.name}")
+                    )
+                well_qc = None
+                if qc_path:
+                    well_qc = qc_path / f"{plate_name}_{well_name}"
                 process_single(
                     filepaths, mosaic_path_format, flip_x, flip_y,
                     ffp_paths, dfp_paths, barrel_correction, aligner_args,
-                    mosaic_args, pyramid, None, quiet, plate_well=(p, w)
+                    mosaic_args, pyramid, well_report, quiet,
+                    plate_well=(p, w), qc_path=well_qc, qc_args=qc_args,
                 )
             else:
                 print("Skipping -- No images found.")
@@ -429,10 +464,24 @@ def warning_formatter(message, category, filename, lineno, line=None):
         return _old_formatwarning(message, category, filename, lineno, line)
 
 
+# Data warnings seen during this run, written to the QC output.
+captured_warnings = []
+
+
 def configure_warning_format():
-    global _old_formatwarning
+    global _old_formatwarning, _old_showwarning
     _old_formatwarning = warnings.formatwarning
     warnings.formatwarning = warning_formatter
+    _old_showwarning = warnings.showwarning
+    warnings.showwarning = record_warning
+
+
+def record_warning(message, category, filename, lineno, file=None, line=None):
+    if issubclass(category, reg.Warning):
+        captured_warnings.append(warnings.WarningMessage(
+            message, category, filename, lineno, file, line
+        ))
+    _old_showwarning(message, category, filename, lineno, file, line)
 
 
 class HelpFormatter(argparse.HelpFormatter):
