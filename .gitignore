@@ -9,3 +9,6 @@ ashlar/jars
 output/*
 
 .obsidian/*
+
+# Local QC runs
+outdir/

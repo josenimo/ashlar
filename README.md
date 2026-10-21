@@ -14,6 +14,29 @@ images.
 
 **Visit [labsyspharm.github.io/ashlar/](https://labsyspharm.github.io/ashlar/) for the most up-to-date information on ASHLAR.**
 
+## This fork
+
+`josenimo/ashlar` branch `histo-qc`, image `josenimo/ashlar` (built for the histo
+pipeline), adds to upstream:
+
+- rotation correction between cycles (jmuhlich `rotation-correction`);
+- negative `-c/--align-channel` values, counted from each cycle's last
+  channel (`-c -1` aligns every cycle on its own last channel);
+- `--report FILE.pdf`, the PDF QC report from jmuhlich `qc-report`, extended
+  with a summary, foreground, registered-overlay and rotation pages;
+- `--qc-output DIR`, machine-readable QC written before the mosaic:
+
+  | File | Contents |
+  |---|---|
+  | `qc.json` | Run summary: cycle 0 stitching (edge acceptance, error threshold, spanning-tree components, stage model) and per-cycle registration (offset, angle, discards by reason, residuals) |
+  | `edges.csv` | One row per neighbouring tile pair in cycle 0: shift, raw and final error, rejection reason, spanning-tree membership |
+  | `tiles.csv` | One row per tile per cycle: nominal and final positions, shift, error, residual from the stage model, angle, discard flags, foreground |
+  | `null_errors.csv` | Errors of random non-overlapping strips (the null distribution) |
+  | `thumb_cycleN.jpg`, `overlay_cycleN.jpg` | Thumbnails at final positions; cycle 0 (magenta) over cycle N (green) |
+
+  Cycles count from 0, coordinates are `[y, x]` pixels unless named `_um`,
+  and errors are -log NCC (lower is better).
+
 ## Usage
 
 ```

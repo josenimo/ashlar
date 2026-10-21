@@ -21,6 +21,13 @@ jobs:
       - name: Build the Docker container
         run: docker build -t ashlar:test .
 
+      - name: Unit tests
+        run: |
+          # Run from a copy so the installed package (with its BioFormats jar) is imported,
+          # not the checkout, which has no jar.
+          docker run -v "$PWD":/src:ro ashlar:test /bin/bash -c \
+            "pip3 install -q pytest && cp -r /src/tests /tmp/tests && cd /tmp && python3 -m pytest tests -q -p no:cacheprovider"
+
       # Cache test data to avoid repeated download
       - uses: actions/cache@v4
         id: cache-data
@@ -48,11 +55,25 @@ jobs:
           cd ~/data/
           rm -f exemplar-001.ome.tif
           docker run -v "$PWD":/data ashlar:test /bin/bash -c "cd /data; \
-            ashlar $imgs -m 30 --dfp $dfp --ffp $ffp -o exemplar-001.ome.tif"
+            ashlar $imgs -m 30 --dfp $dfp --ffp $ffp -o exemplar-001.ome.tif \
+              --qc-output qc --report qc/report.pdf"
         env:
           imgs: 'exemplar-001-cycle-06.ome.tiff exemplar-001-cycle-07.ome.tiff exemplar-001-cycle-08.ome.tiff'
           dfp: 'exemplar-001-cycle-06-dfp.tif exemplar-001-cycle-07-dfp.tif exemplar-001-cycle-08-dfp.tif'
           ffp: 'exemplar-001-cycle-06-ffp.tif exemplar-001-cycle-07-ffp.tif exemplar-001-cycle-08-ffp.tif'
+
+      - name: Check QC output
+        run: |
+          cd ~/data/
+          python3 - <<'PY'
+          import json
+          qc = json.load(open("qc/qc.json"))
+          assert qc["stitching"]["n_tiles"] > 1, qc["stitching"]
+          assert len(qc["registration"]) == 2, len(qc["registration"])
+          assert qc["stitching"]["n_edges_accepted"] > 0
+          PY
+          test -s qc/report.pdf
+          test -s qc/tiles.csv && test -s qc/edges.csv
 
       # If the action is successful, the output will be available as a downloadable artifact
       - name: Upload processed result
@@ -61,3 +82,4 @@ jobs:
           name: exemplar-001
           path: |
             ~/data/exemplar-001.ome.tif
+            ~/data/qc/

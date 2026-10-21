@@ -1,5 +1,6 @@
 import warnings
 import sys
+import traceback
 import re
 import argparse
 import pathlib
@@ -9,6 +10,8 @@ from .. import reg
 from ..reg import PlateReader, BioformatsReader
 from ..filepattern import FilePatternReader
 from ..fileseries import FileSeriesReader
+from ..report import generate_report
+from ..qc import summarize, write_qc
 from ..zen import ZenReader
 
 
@@ -36,7 +39,8 @@ def main(argv=sys.argv):
         '-c', '--align-channel', dest='align_channel', type=int,
         default='0', metavar='CHANNEL',
         help=('Reference channel number for image alignment. Numbering starts'
-              ' at 0.'),
+              ' at 0; negative values count from the last channel of each'
+              ' cycle.'),
     )
     parser.add_argument(
         '--flip-x', default=False, action='store_true',
@@ -110,6 +114,18 @@ def main(argv=sys.argv):
         help='Enable plate mode for HTS data',
     )
     parser.add_argument(
+        "--report", metavar="FILE", type=str_file_pdf,
+        help=("Generate quality control report in FILE in PDF format. FILE"
+              " must end in .pdf (default: no report)"),
+    )
+    parser.add_argument(
+        "--qc-output", metavar="DIR", type=pathlib.Path,
+        help=("Write machine-readable stitching and registration QC (JSON,"
+              " CSV and JPEG files) into DIR, creating it if needed. In plate"
+              " mode one subdirectory per well is written. (default: no QC"
+              " output)"),
+    )
+    parser.add_argument(
         '-q', '--quiet', dest='quiet', default=False,
         action='store_true', help='Suppress progress display',
     )
@@ -174,6 +190,11 @@ def main(argv=sys.argv):
         print_error("--tile-size can only be used with OME-TIFF output")
         return 1
 
+    qc_args = {
+        k: (str(v) if isinstance(v, pathlib.Path) else v)
+        for k, v in vars(args).items()
+    }
+
     ffp_paths = args.ffp
     if ffp_paths:
         if len(ffp_paths) not in (0, 1, len(filepaths)):
@@ -219,14 +240,17 @@ def main(argv=sys.argv):
             return process_plates(
                 filepaths, output_path, args.filename_format, args.flip_x,
                 args.flip_y, ffp_paths, dfp_paths, args.barrel_correction,
-                aligner_args, mosaic_args, args.pyramid, args.quiet
+                aligner_args, mosaic_args, args.pyramid, args.quiet,
+                report_path=args.report, qc_path=args.qc_output,
+                qc_args=qc_args,
             )
         else:
             mosaic_path_format = str(output_path / args.filename_format)
             return process_single(
                 filepaths, mosaic_path_format, args.flip_x, args.flip_y,
                 ffp_paths, dfp_paths, args.barrel_correction, aligner_args,
-                mosaic_args, args.pyramid, args.quiet
+                mosaic_args, args.pyramid, args.report, args.quiet,
+                qc_path=args.qc_output, qc_args=qc_args,
             )
     except ProcessingError as e:
         print_error(str(e))
@@ -235,8 +259,8 @@ def main(argv=sys.argv):
 
 def process_single(
     filepaths, output_path_format, flip_x, flip_y, ffp_paths, dfp_paths,
-    barrel_correction, aligner_args, mosaic_args, pyramid, quiet,
-    plate_well=None
+    barrel_correction, aligner_args, mosaic_args, pyramid, report_path, quiet,
+    plate_well=None, qc_path=None, qc_args=None
 ):
 
     mosaic_args = mosaic_args.copy()
@@ -254,9 +278,12 @@ def process_single(
     reader = build_reader(filepaths[0], barrel_correction, plate_well=plate_well)
     process_axis_flip(reader, flip_x, flip_y)
     ea_args = aligner_args.copy()
+    # Copy so plate mode passes the stitching-only args to every well.
+    aligner_args = aligner_args.copy()
     for arg in ("alpha", "max_error"):
         aligner_args.pop(arg, None)
-    if len(filepaths) == 1:
+    # Skip thumbnail unless 2+ cycles, report or QC output is enabled.
+    if len(filepaths) == 1 and report_path is None and qc_path is None:
         ea_args['do_make_thumbnail'] = False
     edge_aligner = reg.EdgeAligner(reader, **ea_args)
     edge_aligner.run()
@@ -283,7 +310,37 @@ def process_single(
             mosaic_args_final['dfp_path'] = dfp_paths[cycle]
         mosaics.append(reg.Mosaic(layer_aligner, mshape, **mosaic_args_final))
 
+    # Write QC before the (slow) mosaic so it survives a failed write.
+    aligners = [m.aligner for m in mosaics]
+    qc_kwargs = dict(
+        filepaths=filepaths, args=qc_args, warnings=unique_warnings(),
+    )
+    # QC must never cost the mosaic: report a failure and carry on writing.
+    summary = None
+    if qc_path:
+        if not quiet:
+            print()
+            print(f"Writing QC output to {qc_path}")
+        try:
+            summary = write_qc(qc_path, aligners, **qc_kwargs)
+        except Exception:
+            traceback.print_exc()
+            print_error("QC output failed; continuing with the mosaic")
+    if report_path:
+        if not quiet:
+            print(f"Writing QC report to {report_path}")
+        try:
+            generate_report(
+                report_path, aligners,
+                summary or summarize(aligners, **qc_kwargs),
+            )
+        except Exception:
+            traceback.print_exc()
+            print_error("QC report failed; continuing with the mosaic")
+
     # Disable reader caching to save memory during mosaicing and writing.
+    if hasattr(edge_aligner.reader, "thumbnail"):
+        edge_aligner.reader.reader.thumbnail = edge_aligner.reader.thumbnail
     edge_aligner.reader = edge_aligner.reader.reader
 
     if not quiet:
@@ -300,7 +357,8 @@ def process_single(
 
 def process_plates(
     filepaths, output_path, filename_format, flip_x, flip_y, ffp_paths,
-    dfp_paths, barrel_correction, aligner_args, mosaic_args, pyramid, quiet
+    dfp_paths, barrel_correction, aligner_args, mosaic_args, pyramid, quiet,
+    report_path=None, qc_path=None, qc_args=None
 ):
 
     temp_reader = build_reader(filepaths[0])
@@ -322,10 +380,20 @@ def process_plates(
                     out_file_path = plate_path / well_name / filename_format
                 out_file_path.parent.mkdir(parents=True, exist_ok=True)
                 mosaic_path_format = str(out_file_path)
+                well_report = None
+                if report_path:
+                    rp = pathlib.Path(report_path)
+                    well_report = str(
+                        rp.with_name(f"{plate_name}_{well_name}_{rp.name}")
+                    )
+                well_qc = None
+                if qc_path:
+                    well_qc = qc_path / f"{plate_name}_{well_name}"
                 process_single(
                     filepaths, mosaic_path_format, flip_x, flip_y,
                     ffp_paths, dfp_paths, barrel_correction, aligner_args,
-                    mosaic_args, pyramid, quiet, plate_well=(p, w)
+                    mosaic_args, pyramid, well_report, quiet,
+                    plate_well=(p, w), qc_path=well_qc, qc_args=qc_args,
                 )
             else:
                 print("Skipping -- No images found.")
@@ -410,10 +478,32 @@ def warning_formatter(message, category, filename, lineno, line=None):
         return _old_formatwarning(message, category, filename, lineno, line)
 
 
+# Data warnings seen during this run, written to the QC output.
+captured_warnings = []
+
+
 def configure_warning_format():
-    global _old_formatwarning
+    global _old_formatwarning, _old_showwarning
     _old_formatwarning = warnings.formatwarning
     warnings.formatwarning = warning_formatter
+    _old_showwarning = warnings.showwarning
+    warnings.showwarning = record_warning
+
+
+def unique_warnings():
+    """Captured warning texts, repeats folded into one line with a count."""
+    counts = {}
+    for w in captured_warnings:
+        counts[str(w.message)] = counts.get(str(w.message), 0) + 1
+    return [m if n == 1 else f"{m} (x{n})" for m, n in counts.items()]
+
+
+def record_warning(message, category, filename, lineno, file=None, line=None):
+    if issubclass(category, reg.Warning):
+        captured_warnings.append(warnings.WarningMessage(
+            message, category, filename, lineno, file, line
+        ))
+    _old_showwarning(message, category, filename, lineno, file, line)
 
 
 class HelpFormatter(argparse.HelpFormatter):
@@ -436,6 +526,12 @@ class HelpFormatter(argparse.HelpFormatter):
             if action.option_strings or action.nargs in defaulting_nargs:
                 help += " (default: %(default)s)"
         return help
+
+
+def str_file_pdf(v):
+    if not re.search(r"\.pdf$", v):
+        raise argparse.ArgumentTypeError(f"path does not end in .pdf: '{v}'")
+    return v
 
 
 class ProcessingError(RuntimeError):
