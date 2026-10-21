@@ -12,3 +12,6 @@ output/*
 
 # Local QC runs
 outdir/
+
+# Finder metadata; tracked copies made every build report a .dirty version
+.DS_Store
