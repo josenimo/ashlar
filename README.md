@@ -14,10 +14,10 @@ images.
 
 **Visit [labsyspharm.github.io/ashlar/](https://labsyspharm.github.io/ashlar/) for the most up-to-date information on ASHLAR.**
 
-## This fork (jose_ashlar)
+## This fork
 
-`josenimo/ashlar` branch `histo-qc`, image `josenimo/jose_ashlar`, adds to
-upstream:
+`josenimo/ashlar` branch `histo-qc`, image `josenimo/ashlar` (built for the histo
+pipeline), adds to upstream:
 
 - rotation correction between cycles (jmuhlich `rotation-correction`);
 - negative `-c/--align-channel` values, counted from each cycle's last
