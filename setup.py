@@ -16,6 +16,8 @@ requires = [
     'scikit-image>=0.19.2',
     'scikit-learn>=0.21.1',
     'tifffile>=2023.3.15',
+    # tifffile needs it to decode deflate+predictor TIFFs (BaSiCPy profiles).
+    'imagecodecs',
     'zarr>=2.11.3',
     'blessed>=1.17',
     'Pillow>=9.0.0',
