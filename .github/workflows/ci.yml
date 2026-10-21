@@ -23,8 +23,10 @@ jobs:
 
       - name: Unit tests
         run: |
-          docker run -v "$PWD":/src ashlar:test /bin/bash -c \
-            "pip3 install -q pytest && cd /src && python3 -m pytest tests -q"
+          # Run from a copy so the installed package (with its BioFormats jar) is imported,
+          # not the checkout, which has no jar.
+          docker run -v "$PWD":/src:ro ashlar:test /bin/bash -c \
+            "pip3 install -q pytest && cp -r /src/tests /tmp/tests && cd /tmp && python3 -m pytest tests -q -p no:cacheprovider"
 
       # Cache test data to avoid repeated download
       - uses: actions/cache@v4
